@@ -1,0 +1,200 @@
+---
+title: "RNA-seq Cohort Explorer"
+output:
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    social: menu
+    source_code: embed
+runtime: shiny
+---
+
+```{r global, include=FALSE}
+library(shiny); library(flexdashboard); library(plotly); library(DT)
+library(ggplot2); library(survival); library(survminer)
+
+# Resolve paths relative to the repository root regardless of where the app is launched
+root <- normalizePath(if (dir.exists("R")) "." else "..")
+for (f in list.files(file.path(root, "R"), full.names = TRUE, pattern = "\\.R$")) source(f)
+
+cfg <- read_cohort_config(file.path(root, "config", "cohorts.csv"))
+cohort_ids <- stats::setNames(cfg$cohort, cfg$label)
+cohorts <- lapply(cfg$cohort, load_cohort, data_dir = file.path(root, "data"))
+names(cohorts) <- cfg$cohort
+genesets <- load_genesets(file.path(root, "data", "genesets.rds"))
+
+cache_dir <- file.path(root, "cache"); dir.create(cache_dir, showWarnings = FALSE)
+n_label <- function(id) {
+  c <- cohorts[[id]]
+  sprintf("%s: %d patients with RNA-seq, %d with survival data", id, ncol(c$matrix), nrow(c$survival))
+}
+```
+
+Gene Expression
+=======================================================================
+
+Inputs {.sidebar}
+-----------------------------------------------------------------------
+
+### Gene association
+
+Enter two HGNC gene symbols (e.g. EGFR, ERBB2). Spearman correlation is computed across patients.
+
+```{r}
+textInput("gene1", "Gene 1 symbol:", value = "EGFR")
+textInput("gene2", "Gene 2 symbol:", value = "ERBB2")
+selectInput("cohort1", "Patient cohort:", cohort_ids)
+checkboxInput("transformed", "Natural log transform", value = TRUE)
+renderText(n_label(input$cohort1))
+```
+
+Outputs
+-----------------------------------------------------------------------
+
+### Correlation plot
+
+```{r}
+cor_res <- reactive({
+  req(input$gene1, input$gene2)
+  g <- toupper(trimws(c(input$gene1, input$gene2)))
+  validate(need(all(g %in% rownames(cohorts[[input$cohort1]]$matrix)),
+                "Gene symbol not found in this cohort"))
+  correlate_genes(cohorts[[input$cohort1]]$matrix, g[1], g[2], input$transformed)
+})
+
+renderPlotly({
+  r <- cor_res(); d <- r$data
+  p <- ggplot(d, aes(.data[[names(d)[1]]], .data[[names(d)[2]]])) +
+    geom_point(size = 1.5, alpha = 0.7) + theme_classic() +
+    labs(x = paste(names(d)[1], "mRNA expression"), y = paste(names(d)[2], "mRNA expression"))
+  ggplotly(p) %>% layout(title = list(text = paste0(
+    "Correlation plot for ", input$cohort1, "<br><sup>Spearman rho ", round(r$rho, 2),
+    "; ", format_p(r$p), "</sup>")))
+})
+```
+
+### Expression distribution
+
+```{r}
+renderPlot({
+  d <- cor_res()$data
+  ord <- order(d[[1]], decreasing = TRUE)
+  op <- par(mfrow = c(2, 1), mar = c(1, 4, 3, 1)); on.exit(par(op))
+  barplot(d[[1]][ord], main = names(d)[1], ylab = "expression")
+  barplot(d[[2]][ord], main = names(d)[2], ylab = "expression")
+})
+```
+
+Pathway Analysis
+=======================================================================
+
+Inputs {.sidebar}
+-----------------------------------------------------------------------
+
+### Pathway analysis
+
+Genes are ranked by Spearman correlation with the query gene and tested against a gene-set
+collection with pre-ranked GSEA. First run for a new query takes 10-30 s; results are cached.
+
+```{r}
+textInput("gene", "Gene symbol:", value = "EGFR")
+selectInput("set", "Gene set collection:", names(genesets))
+selectInput("cohort", "Patient cohort:", cohort_ids)
+numericInput("pval", "Significance threshold (FDR)", value = 0.05, min = 0, max = 1, step = 0.01)
+```
+
+Outputs
+-----------------------------------------------------------------------
+
+### Pathways table
+
+```{r}
+pathways <- reactive({
+  req(input$gene)
+  g <- toupper(trimws(input$gene))
+  cohort <- cohorts[[input$cohort]]
+  validate(need(g %in% rownames(cohort$matrix), "Gene symbol not found in this cohort"))
+  f <- file.path(cache_dir, paste0(g, "_", input$cohort, "_", input$set, "_", input$pval, ".rds"))
+  if (file.exists(f)) return(readRDS(f))
+  withProgress(message = "Running GSEA", value = 0.5, {
+    ranked <- rank_by_correlation(cohort$matrix, g, cohort$top_genes)
+    res <- run_gsea(ranked, genesets[[input$set]], input$pval)
+  })
+  saveRDS(res, f)
+  res
+})
+
+DT::renderDataTable({
+  title <- paste(toupper(trimws(input$gene)), input$cohort)
+  btn <- lapply(c("copy", "csv", "excel", "pdf", "print"), function(b) list(extend = b, title = title))
+  DT::datatable(pathways(), rownames = FALSE, extensions = "Buttons", fillContainer = TRUE,
+                options = list(dom = "Blfrtip", buttons = btn,
+                               lengthMenu = list(c(25, 50, -1), c("25", "50", "All"))))
+})
+```
+
+Overall Survival
+=======================================================================
+
+Inputs {.sidebar}
+-----------------------------------------------------------------------
+
+Untick the max-stat option to split patients at the **median** instead of the optimal cut-point.
+
+```{r}
+textInput("gene_os", "Gene symbol:", value = "EGFR")
+selectInput("cohort_os", "Patient cohort:", cohort_ids)
+checkboxInput("maxstat", "Max-stat method for optimal cutoff", value = TRUE)
+renderText(n_label(input$cohort_os))
+```
+
+Outputs
+-----------------------------------------------------------------------
+
+### Kaplan-Meier curve
+
+```{r}
+surv_res <- reactive({
+  req(input$gene_os)
+  g <- toupper(trimws(input$gene_os))
+  c <- cohorts[[input$cohort_os]]
+  validate(need(g %in% rownames(c$matrix), "Gene symbol not found in this cohort"))
+  stratify_survival(c$matrix, c$survival, g, input$maxstat)
+})
+
+renderPlot({
+  d <- surv_res()$data
+  fit <- survfit(Surv(os_months, death) ~ group, data = d)
+  ggsurvplot(fit, data = d, xlab = "Months", ylab = "Overall survival probability",
+             pval = TRUE, risk.table = TRUE)
+})
+```
+
+### Cutoff analysis
+
+```{r}
+renderPlot({
+  r <- surv_res()
+  if (!is.null(r$cutpoint)) {
+    plot(r$cutpoint, "expression")
+  } else {
+    v <- sort(r$data$expression, decreasing = TRUE)
+    barplot(v, ylab = "expression", sub = "Median shown as dashed red line")
+    abline(h = median(v), col = "red", lty = 2)
+  }
+})
+```
+
+About
+=======================================================================
+
+#### Data
+Public TCGA PanCancer Atlas RNA-seq (RSEM, batch-normalised) and overall survival, downloaded
+from [cBioPortal](https://www.cbioportal.org). Primary tumours only, one sample per patient.
+
+#### Pathway analysis
+Pre-ranked GSEA (`clusterProfiler`): the top 15,000 genes by median expression are ranked by Spearman
+correlation with the query gene and tested against MSigDB Hallmark, Reactome or KEGG (legacy) sets.
+
+#### Caveats
+- Gene-level expression only; no isoform quantification.
+- Exploratory tool: multiple testing applies, so use hypothesis-driven queries.

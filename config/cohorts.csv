@@ -1,0 +1,3 @@
+cohort,label,study_id
+TCGA-LUAD,Lung adenocarcinoma (TCGA),luad_tcga_pan_can_atlas_2018
+TCGA-KIRC,Kidney clear cell carcinoma (TCGA),kirc_tcga_pan_can_atlas_2018
